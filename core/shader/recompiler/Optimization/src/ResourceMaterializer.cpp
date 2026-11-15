@@ -1783,12 +1783,15 @@ void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot) {
         }
         const auto decoded = decodeBufferDescriptor(snapshot.buffers.at(i));
         if (decoded.Type() != 0u) {
-            const auto& words = snapshot.buffers.at(i).dwords;
-            char detail[96];
-            std::snprintf(detail, sizeof(detail), " (buffer %u V# %08x %08x %08x %08x) first used at pc 0x%x", i, words[0], words[1], words[2], words[3], buffer.firstUsePc);
-            throw std::runtime_error(std::string("buffer descriptor uses an unsupported type") + detail);
+            if (buffer.formatted || buffer.descriptorFormatted) {
+                const auto& words = snapshot.buffers.at(i).dwords;
+                char detail[96];
+                std::snprintf(detail, sizeof(detail), " (buffer %u V# %08x %08x %08x %08x) first used at pc 0x%x", i, words[0], words[1], words[2], words[3], buffer.firstUsePc);
+                throw std::runtime_error(std::string("buffer descriptor uses an unsupported type") + detail);
+            }
+            snapshot.buffers.at(i).dwords[3] &= 0x3fffffffu;
         }
-        if (plan.stage != IrShaderStage::Compute && decoded.AddTid()) throw std::runtime_error("buffer ADD_TID is only valid for compute shaders");
+
     }
     if (snapshot.flattenedSrt.size() != plan.srtReads.size()) throw std::runtime_error("runtime SRT size differs from the static interface");
     for (std::uint32_t i = 0u; i < plan.info.images.size(); ++i) {
