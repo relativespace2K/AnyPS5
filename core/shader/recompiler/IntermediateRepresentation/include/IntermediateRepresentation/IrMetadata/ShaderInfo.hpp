@@ -30,6 +30,7 @@ struct ShaderInfo {
     bool instanceOffsetShared = false;
     bool vertexOffsetConflict = false;
     bool instanceOffsetConflict = false;
+    bool vertexIndexObserved = false;
     bool hasBitwiseXor = false;
     bool usesDma = false;
     bool bdaWrites = false;

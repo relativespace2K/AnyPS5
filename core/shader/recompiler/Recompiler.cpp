@@ -827,6 +827,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.fragmentDescriptorSet = request.target.registrationModules;
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
     targetOptions.spannedWaves = request.target.spannedWaves;
+    targetOptions.vertexSubgroups = request.target.vertexSubgroups;
     targetOptions.robustBufferAccess2 = request.target.robustBufferAccess2;
     targetOptions.exactRobustLoads = request.target.exactRobustLoads;
     targetOptions.float32FlushToZero = HardwareFloat32Flush(request);
@@ -922,6 +923,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     result.instanceOffsetShared = program.Info().instanceOffsetShared;
     result.vertexOffsetConflict = program.Info().vertexOffsetConflict;
     result.instanceOffsetConflict = program.Info().instanceOffsetConflict;
+    result.vertexIndexObserved = program.Info().vertexIndexObserved;
     for (const auto& output : program.Info().outputs) {
         if (output.kind == StageOutputKind::Parameter) result.parameterExports.push_back(output.location);
     }
@@ -1349,6 +1351,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .instanceOffsetShared = artifact.instanceOffsetShared,
         .vertexOffsetConflict = artifact.vertexOffsetConflict,
         .instanceOffsetConflict = artifact.instanceOffsetConflict,
+        .vertexIndexObserved = artifact.vertexIndexObserved,
         .hostSubgroupSize = artifact.hostSubgroupSize,
         .fullSubgroups = artifact.fullSubgroups,
         .functionLdsBuffer = artifact.functionLdsBuffer,

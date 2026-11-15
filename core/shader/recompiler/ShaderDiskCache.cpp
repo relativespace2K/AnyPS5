@@ -143,7 +143,7 @@ constexpr std::size_t fieldCount() {
     }
 }
 
-static_assert(fieldCount<ShaderInfo>() == 24, "ShaderInfo changed: update the info encoder");
+static_assert(fieldCount<ShaderInfo>() == 25, "ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 12, "BufferResource changed: update the info encoder");
 static_assert(fieldCount<ImageResource>() == 51, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: update the info encoder");
@@ -543,6 +543,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.instanceOffsetShared);
     writer.Value(result.vertexOffsetConflict);
     writer.Value(result.instanceOffsetConflict);
+    writer.Value(result.vertexIndexObserved);
     writer.Value(result.hostSubgroupSize);
     writer.Value(result.fullSubgroups);
     writer.Value(result.functionLdsBuffer);
@@ -610,6 +611,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.instanceOffsetShared);
     reader.Value(result.vertexOffsetConflict);
     reader.Value(result.instanceOffsetConflict);
+    reader.Value(result.vertexIndexObserved);
     reader.Value(result.hostSubgroupSize);
     reader.Value(result.fullSubgroups);
     reader.Value(result.functionLdsBuffer);
@@ -869,6 +871,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
     writer.Value(info.instanceOffsetShared);
     writer.Value(info.vertexOffsetConflict);
     writer.Value(info.instanceOffsetConflict);
+    writer.Value(info.vertexIndexObserved);
     writer.Value(info.hasBitwiseXor);
     writer.Value(info.usesDma);
     writer.Value(info.bdaWrites);
@@ -988,6 +991,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
     reader.Value(info.instanceOffsetShared);
     reader.Value(info.vertexOffsetConflict);
     reader.Value(info.instanceOffsetConflict);
+    reader.Value(info.vertexIndexObserved);
     reader.Value(info.hasBitwiseXor);
     reader.Value(info.usesDma);
     reader.Value(info.bdaWrites);

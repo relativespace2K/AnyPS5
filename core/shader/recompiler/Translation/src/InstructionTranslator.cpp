@@ -623,6 +623,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         program.Info().instanceOffsetShared = options.embeddedFetch->instanceOffsetShared || options.embeddedFetch->instanceIndexObserved;
         program.Info().vertexOffsetConflict = options.embeddedFetch->vertexOffsetConflict;
         program.Info().instanceOffsetConflict = options.embeddedFetch->instanceOffsetConflict;
+        program.Info().vertexIndexObserved = options.embeddedFetch->vertexIndexObserved;
     }
     program.Metadata().cfgFailureKind = cfg.failureKind;
     program.Metadata().failureReason = cfg.unsupportedReason;

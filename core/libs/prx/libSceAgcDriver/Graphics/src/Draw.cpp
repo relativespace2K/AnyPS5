@@ -1766,7 +1766,7 @@ void requireDrawPlanRepeats(const Context& context, const State& state, const Pm
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawPlan& drawPlan, DrawTimer& timer, PerformanceTimer& timing) {
     DrawInputs inputs;
     const bool runtimeVertexFetch = shaders.front().program->vertexAttributes.empty();
-    const bool keepFirstVertex = runtimeVertexFetch || shaders.front().program->vertexOffsetShared;
+    const bool keepFirstVertex = runtimeVertexFetch || shaders.front().program->vertexIndexObserved;
     inputs.firstVertex = keepFirstVertex ? draw.firstVertex : 0;
     inputs.indexBytes = drawPlan.indexBytes;
     inputs.fragmentOutputs = drawPlan.fragmentOutputs;

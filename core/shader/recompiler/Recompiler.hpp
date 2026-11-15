@@ -917,6 +917,7 @@ struct CompiledShaderArtifact {
     bool instanceOffsetShared = false;
     bool vertexOffsetConflict = false;
     bool instanceOffsetConflict = false;
+    bool vertexIndexObserved = false;
     std::uint32_t hostSubgroupSize = 0;
     bool fullSubgroups = false;
     bool functionLdsBuffer = false;
