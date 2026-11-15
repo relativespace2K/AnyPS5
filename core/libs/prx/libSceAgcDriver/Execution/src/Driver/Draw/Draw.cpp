@@ -742,6 +742,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.dumpSlot1 = dumpSlot1;
     tail.packetOffset = packetOffset;
     const bool handOff = pipelined && !drawParameters.indirect && !profile && !lockedPrepare && !dumpGraphics && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawDataHits() && deferredLabels().labels.empty() && DrawFinisher::Enabled();
+    if (!handOff) {
+        static const bool traceOff = std::getenv("APS5_TRACE_FINISHER_OFF") != nullptr;
+        static std::atomic<std::uint64_t> offCount{0};
+        if (traceOff && offCount.fetch_add(1, std::memory_order_relaxed) < 20) {
+            std::fprintf(stderr, "[finisher-off] pipelined=%u indirect=%u profile=%u locked=%u dump=%u target=%llu slot1=%llu trace=%u verify=%u labels=%zu enabled=%u\n",
+                static_cast<unsigned>(pipelined), static_cast<unsigned>(drawParameters.indirect.has_value()), static_cast<unsigned>(profile), static_cast<unsigned>(lockedPrepare), static_cast<unsigned>(dumpGraphics),
+                static_cast<unsigned long long>(dumpTarget), static_cast<unsigned long long>(dumpSlot1), static_cast<unsigned>(tracePrograms), static_cast<unsigned>(verifyDrawDataHits()), deferredLabels().labels.size(), static_cast<unsigned>(DrawFinisher::Enabled()));
+        }
+    }
     if (handOff) {
         tail.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         tail.submissionSerial = submission.serial;
