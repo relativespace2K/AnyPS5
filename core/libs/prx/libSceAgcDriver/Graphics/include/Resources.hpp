@@ -7,6 +7,8 @@
 
 namespace AgcDriver::Graphics {
 
+void ClearSparseInputs(VkDevice device);
+
 class Buffer {
 public:
     Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);

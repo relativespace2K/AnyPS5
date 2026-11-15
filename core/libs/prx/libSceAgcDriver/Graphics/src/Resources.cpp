@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <exception>
 #include <limits>
+#include <list>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -60,14 +61,18 @@ VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsage
     return buffer;
 }
 
-void UploadSparsePiece(const Context& context, VkBuffer destination, VkDeviceSize destinationOffset, std::uint64_t source, VkDeviceSize bytes) {
+bool SparseUploadOnSettleQueue(const Context& context) {
+    return context.settleQueue != VK_NULL_HANDLE && context.settleQueueMutex != nullptr && context.settleFamily == context.queueFamily;
+}
+
+void UploadSparsePiece(const Context& context, VkBuffer destination, VkDeviceSize destinationOffset, std::uint64_t source, VkDeviceSize bytes, VkQueue queue, std::uint32_t queueFamily, std::mutex* queueMutex) {
     constexpr VkDeviceSize StagingBytes = VkDeviceSize{16} << 20u;
     const auto stagingBytes = static_cast<std::size_t>(std::min(bytes, StagingBytes));
     auto staging = std::make_shared<Buffer>(context, stagingBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     const auto stagingSpan = staging->Bytes();
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    poolInfo.queueFamilyIndex = context.queueFamily;
+    poolInfo.queueFamilyIndex = queueFamily;
     VkCommandPool pool = VK_NULL_HANDLE;
     Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &poolInfo, nullptr, &pool), "vkCreateCommandPool sparse upload");
     VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -91,7 +96,13 @@ void UploadSparsePiece(const Context& context, VkBuffer destination, VkDeviceSiz
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &commands;
-        Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, fence), "vkQueueSubmit sparse upload");
+        {
+            std::unique_lock<std::mutex> queueLock;
+            if (queueMutex != nullptr) queueLock = std::unique_lock<std::mutex>(*queueMutex);
+            const auto submitted = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(queue, 1, &submit, fence);
+            if (submitted != VK_SUCCESS) std::fprintf(stderr, "[gpu] sparse upload submit failed: dst=0x%llx+0x%llx family=%u result=%d\n", static_cast<unsigned long long>(destinationOffset + offset), static_cast<unsigned long long>(chunk), static_cast<unsigned>(queueFamily), static_cast<int>(submitted));
+            Check(submitted, "vkQueueSubmit sparse upload");
+        }
         Check(context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences sparse upload");
         Check(context.Function<PFN_vkResetFences>("vkResetFences")(context.device, 1, &fence), "vkResetFences sparse upload");
         Check(context.Function<PFN_vkResetCommandBuffer>("vkResetCommandBuffer")(commands, 0), "vkResetCommandBuffer sparse upload");
@@ -100,6 +111,67 @@ void UploadSparsePiece(const Context& context, VkBuffer destination, VkDeviceSiz
     context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(context.device, pool, nullptr);
 }
 
+struct SparseInputEntry {
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    VkBufferUsageFlags usage = 0;
+    std::shared_ptr<Buffer> buffer;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> bound;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> seen;
+    std::uint64_t generation = 0;
+};
+
+std::mutex sparseInputsMutex;
+std::list<SparseInputEntry> sparseInputs;
+constexpr std::size_t SparseInputEntries = 32;
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> SparseRanges(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t begin, std::uint64_t end, VkDeviceSize alignment) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> out;
+    for (const auto& [rawFirst, rawLast] : ranges) {
+        const auto first = std::max<std::uint64_t>(rawFirst, begin);
+        const auto last = std::min<std::uint64_t>(rawLast, end);
+        if (first >= last) continue;
+        const auto alignedFirst = (first + alignment - 1) & ~(alignment - 1);
+        const auto alignedLast = last & ~(alignment - 1);
+        if (alignedFirst < alignedLast) out.emplace_back(alignedFirst, alignedLast);
+    }
+    return out;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> MergeSparseRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    for (const auto& [first, last] : ranges) {
+        if (!merged.empty() && first <= merged.back().second) merged.back().second = std::max(merged.back().second, last);
+        else merged.emplace_back(first, last);
+    }
+    return merged;
+}
+
+bool SparseRangeCovered(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& bound, std::uint64_t first, std::uint64_t last) {
+    for (const auto& [boundFirst, boundLast] : bound) {
+        if (first >= boundFirst && last <= boundLast) return true;
+    }
+    return false;
+}
+
+bool SparseRangesCovered(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& bound, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& wanted) {
+    for (const auto& [first, last] : wanted) {
+        if (!SparseRangeCovered(bound, first, last)) return false;
+    }
+    return true;
+}
+
+void UploadSparseRanges(const Context& context, VkBuffer destination, std::uint64_t base, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, VkQueue queue, std::uint32_t family, std::mutex* mutex) {
+    for (const auto& [first, last] : ranges) UploadSparsePiece(context, destination, first - base, first, last - first, queue, family, mutex);
+}
+
+}
+
+void ClearSparseInputs(VkDevice device) {
+    std::lock_guard lock(sparseInputsMutex);
+    sparseInputs.remove_if([device](const SparseInputEntry& entry) { return entry.device == device; });
 }
 
 Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : Buffer(context, size, usage, properties, false) {}
@@ -117,8 +189,11 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBuffer buffer, std::v
 
 std::shared_ptr<Buffer> Buffer::SparseGuestImport(const Context& context, const std::uint64_t address, const std::size_t bytes, const VkBufferUsageFlags usage, const VkDeviceSize bindOffset, const VkDeviceSize bindBytes, VkDeviceSize* offset) {
     if (offset == nullptr || bytes == 0 || !context.sparseBinding || !context.sparseResidencyBuffer || context.sparseQueue == VK_NULL_HANDLE) return {};
+    const bool settleUpload = SparseUploadOnSettleQueue(context);
+    if (!settleUpload && !GuestMemory::GpuMutex().HeldByThisThread()) return {};
     constexpr VkDeviceSize Block = 65536;
     constexpr VkDeviceSize Chunk = VkDeviceSize{1} << 29u;
+    constexpr VkDeviceSize Region = VkDeviceSize{4} << 30u;
     const auto alignment = std::max<VkDeviceSize>(Block, context.hostImportAlignment);
     const auto requestedBegin = address & ~(alignment - 1);
     const auto requestedEnd = (address + bytes + alignment - 1) & ~(alignment - 1);
@@ -128,20 +203,44 @@ std::shared_ptr<Buffer> Buffer::SparseGuestImport(const Context& context, const 
     const auto bindBegin = std::max<std::uint64_t>(requestedBegin, (address + bindStart) & ~(alignment - 1));
     const auto bindEnd = std::min<std::uint64_t>(requestedEnd, (address + bindStart + bindLength + alignment - 1) & ~(alignment - 1));
     if (bindEnd <= bindBegin) return {};
-    constexpr VkDeviceSize Region = VkDeviceSize{4} << 30u;
-    const auto regionBase = address & ~(Region - 1);
-    auto cacheBase = regionBase;
-    auto cacheEnd = regionBase + Region;
-    if (requestedBegin < cacheBase || requestedEnd > cacheEnd) {
-        cacheBase = requestedBegin;
-        cacheEnd = requestedEnd;
+    const auto uploadQueue = settleUpload ? context.settleQueue : context.queue;
+    const auto uploadFamily = settleUpload ? context.settleFamily : context.queueFamily;
+    auto* uploadMutex = settleUpload ? context.settleQueueMutex : nullptr;
+    const auto cacheBase = address & ~(Region - 1);
+    const auto cacheEnd = cacheBase + Region;
+    const auto cacheBytes = Region;
+    std::unique_lock<std::mutex> cacheLock(sparseInputsMutex);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> previousBound;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> previousSeen;
+    for (auto entry = sparseInputs.begin(); entry != sparseInputs.end(); ++entry) {
+        if (entry->device != context.device || entry->begin != cacheBase || entry->end != cacheEnd || entry->usage != usage) continue;
+        if (entry->generation != 0 && SparseRangeCovered(entry->seen, bindBegin, bindEnd) && GuestMemory::UnchangedSince(bindBegin, bindEnd - bindBegin, entry->generation)) {
+            sparseInputs.splice(sparseInputs.begin(), sparseInputs, entry);
+            *offset = address - cacheBase;
+            return entry->buffer;
+        }
+        const auto commit = SparseRanges(GuestMemory::DescribeCommitted(bindBegin, bindEnd - bindBegin).ranges, bindBegin, bindEnd, alignment);
+        if (!SparseRangesCovered(entry->bound, commit)) {
+            previousBound = std::move(entry->bound);
+            previousSeen = std::move(entry->seen);
+            sparseInputs.erase(entry);
+            break;
+        }
+        UploadSparseRanges(context, entry->buffer->Handle(), entry->begin, commit, uploadQueue, uploadFamily, uploadMutex);
+        entry->seen.emplace_back(bindBegin, bindEnd);
+        entry->seen = MergeSparseRanges(std::move(entry->seen));
+        entry->generation = GuestMemory::CollectWrites(bindBegin, bindEnd - bindBegin);
+        sparseInputs.splice(sparseInputs.begin(), sparseInputs, entry);
+        *offset = address - cacheBase;
+        return entry->buffer;
     }
-    if (cacheEnd <= cacheBase) return {};
-    const auto cacheBytes = cacheEnd - cacheBase;
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = cacheBytes;
     info.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    const std::array<std::uint32_t, 2> families{context.queueFamily, context.sparseFamily};
+    info.sharingMode = context.sparseFamily != context.queueFamily ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+    info.queueFamilyIndexCount = context.sparseFamily != context.queueFamily ? static_cast<std::uint32_t>(families.size()) : 0;
+    info.pQueueFamilyIndices = context.sparseFamily != context.queueFamily ? families.data() : nullptr;
     info.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT;
     VkBuffer buffer = VK_NULL_HANDLE;
     auto result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer);
@@ -164,7 +263,11 @@ std::shared_ptr<Buffer> Buffer::SparseGuestImport(const Context& context, const 
         VkDeviceSize bytes;
     };
     std::vector<Upload> uploads;
-    const auto commit = GuestMemory::DescribeCommitted(cacheBase, cacheBytes);
+    auto commit = SparseRanges(GuestMemory::DescribeCommitted(bindBegin, bindEnd - bindBegin).ranges, bindBegin, bindEnd, alignment);
+    commit.insert(commit.end(), previousBound.begin(), previousBound.end());
+    commit = MergeSparseRanges(std::move(commit));
+    previousSeen.emplace_back(bindBegin, bindEnd);
+    const auto seen = MergeSparseRanges(std::move(previousSeen));
     std::uint32_t deviceLocalType = 0;
     bool deviceLocalFound = false;
     for (std::uint32_t type = 0; type < context.memory.memoryTypeCount; ++type) {
@@ -178,12 +281,9 @@ std::shared_ptr<Buffer> Buffer::SparseGuestImport(const Context& context, const 
         cleanup();
         return {};
     }
-    for (const auto& [rawFirst, rawLast] : commit.ranges) {
-        const auto first = std::max<std::uint64_t>(rawFirst, bindBegin);
-        const auto last = std::min<std::uint64_t>(rawLast, bindEnd);
-        if (first >= last) continue;
-        auto cursor = (first + alignment - 1) & ~(alignment - 1);
-        const auto limit = last & ~(alignment - 1);
+    for (const auto& [first, last] : commit) {
+        auto cursor = first;
+        const auto limit = last;
         while (cursor < limit) {
             const auto piece = std::min<VkDeviceSize>(limit - cursor, Chunk) & ~(alignment - 1);
             if (piece == 0) break;
@@ -202,31 +302,35 @@ std::shared_ptr<Buffer> Buffer::SparseGuestImport(const Context& context, const 
             uploads.push_back({cursor - cacheBase, cursor, piece});
             cursor += piece;
         }
-    }    if (binds.empty()) {
-        cleanup();
-        return {};
     }
-    VkSparseBufferMemoryBindInfo bufferBind{buffer, static_cast<std::uint32_t>(binds.size()), binds.data()};
-    VkBindSparseInfo sparse{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
-    sparse.bufferBindCount = 1;
-    sparse.pBufferBinds = &bufferBind;
-    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    VkFence fence = VK_NULL_HANDLE;
-    result = context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &fence);
-    if (result == VK_SUCCESS) {
-        std::unique_lock<std::mutex> queueLock;
-        if (context.sparseQueueMutex != nullptr) queueLock = std::unique_lock<std::mutex>(*context.sparseQueueMutex);
-        result = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(context.sparseQueue, 1, &sparse, fence);
-        if (result == VK_SUCCESS) result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max());
-        context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
+    if (!binds.empty()) {
+        VkSparseBufferMemoryBindInfo bufferBind{buffer, static_cast<std::uint32_t>(binds.size()), binds.data()};
+        VkBindSparseInfo sparse{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+        sparse.bufferBindCount = 1;
+        sparse.pBufferBinds = &bufferBind;
+        VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkFence fence = VK_NULL_HANDLE;
+        result = context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &fence);
+        if (result == VK_SUCCESS) {
+            std::unique_lock<std::mutex> queueLock;
+            if (context.sparseQueueMutex != nullptr) queueLock = std::unique_lock<std::mutex>(*context.sparseQueueMutex);
+            result = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(context.sparseQueue, 1, &sparse, fence);
+            if (result == VK_SUCCESS) result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max());
+            context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
+        }
+        if (result != VK_SUCCESS) {
+            std::fprintf(stderr, "[gpu] sparse guest import of 0x%llx+0x%llx: sparse bind failed (%d)\n", static_cast<unsigned long long>(cacheBase), static_cast<unsigned long long>(cacheBytes), static_cast<int>(result));
+            cleanup();
+            return {};
+        }
     }
-    if (result != VK_SUCCESS) {
-        std::fprintf(stderr, "[gpu] sparse guest import of 0x%llx+0x%llx: sparse bind failed (%d)\n", static_cast<unsigned long long>(cacheBase), static_cast<unsigned long long>(cacheBytes), static_cast<int>(result));
-        cleanup();
-        return {};
-    }
-    for (const auto& upload : uploads) UploadSparsePiece(context, buffer, upload.destination, upload.source, upload.bytes);
+    VkDeviceSize uploadBytes = 0;
+    for (const auto& upload : uploads) uploadBytes += upload.bytes;
+    std::fprintf(stderr, "[gpu] sparse guest import 0x%llx+0x%llx: created with %zu bind(s), %zu upload(s) of 0x%llx bytes on queue family %u\n", static_cast<unsigned long long>(cacheBase), static_cast<unsigned long long>(cacheBytes), binds.size(), uploads.size(), static_cast<unsigned long long>(uploadBytes), static_cast<unsigned>(uploadFamily));
+    for (const auto& upload : uploads) UploadSparsePiece(context, buffer, upload.destination, upload.source, upload.bytes, uploadQueue, uploadFamily, uploadMutex);
     std::shared_ptr<Buffer> created(new Buffer(context, static_cast<std::size_t>(cacheBytes), buffer, std::move(memories), {}));
+    sparseInputs.push_front({context.device, cacheBase, cacheEnd, usage, created, commit, seen, GuestMemory::CollectWrites(bindBegin, bindEnd - bindBegin)});
+    while (sparseInputs.size() > SparseInputEntries) sparseInputs.pop_back();
     *offset = address - cacheBase;
     return created;
 }
