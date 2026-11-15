@@ -1606,6 +1606,7 @@ struct DrawInputs {
     VkDeviceSize indexOffset = 0;
     std::uint32_t maxIndex = 0;
     std::uint32_t minIndex = 0;
+    std::uint32_t firstVertex = 0;
     std::optional<std::uint32_t> indexCount;
     std::uint32_t listRestartPrimitive = 0;
     VertexInputLayout vertexInput;
@@ -1764,6 +1765,9 @@ void requireDrawPlanRepeats(const Context& context, const State& state, const Pm
 
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawPlan& drawPlan, DrawTimer& timer, PerformanceTimer& timing) {
     DrawInputs inputs;
+    const bool runtimeVertexFetch = shaders.front().program->vertexAttributes.empty();
+    const bool keepFirstVertex = runtimeVertexFetch || shaders.front().program->vertexOffsetShared;
+    inputs.firstVertex = keepFirstVertex ? draw.firstVertex : 0;
     inputs.indexBytes = drawPlan.indexBytes;
     inputs.fragmentOutputs = drawPlan.fragmentOutputs;
     inputs.shaderStages = drawPlan.shaderStages;
@@ -1783,8 +1787,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     }
     timer.phase(PhaseValidate);
     timing.Mark("validate");
-    inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
-    inputs.minIndex = draw.indexed ? 0u : draw.firstVertex;
+    inputs.maxIndex = draw.indexed ? 0u : (keepFirstVertex ? draw.firstVertex + draw.indexCount - 1u : draw.indexCount - 1u);
+    inputs.minIndex = keepFirstVertex && !draw.indexed ? draw.firstVertex : 0u;
     if (state.quadList || StripPatches(state, shaders)) {
         Require(!draw.indirect, state.quadList ? "indirect quad-list draw is unsupported" : "an indirect triangle strip through emulated barycentric patches is unsupported");
         Require(state.quadList || !draw.indexed || !state.primitiveRestart, "an indexed triangle strip with primitive restart through emulated barycentric patches is unsupported");
@@ -1854,13 +1858,12 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                 }
             };
             expand(readIndex);
-            Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - maxIdx, "indexed draw vertex range overflow");
         } else {
             const std::uint32_t lastVertex = state.quadList ? primitives * 4u - 1u : primitives + 1u;
             Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - lastVertex, "auto draw vertex range overflow");
             expand([](std::uint32_t idx) { return idx; });
         }
-        inputs.maxIndex = draw.indexed ? maxIdx : maxIdx + draw.firstVertex;
+        inputs.maxIndex = keepFirstVertex && !draw.indexed ? maxIdx + draw.firstVertex : maxIdx;
         Require(inputs.maxIndex <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
         inputs.indexHandle = indexCopy->Handle();
         inputs.indexOffset = 0;
@@ -1968,8 +1971,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     const auto& attributes = shaders.front().program->vertexAttributes;
     inputs.vertexOffsets.assign(attributes.size(), 0);
     inputs.vertexHandles.reserve(attributes.size());
-    // An indexed draw's vertex offset moves every fetch: the copy must reach the last one.
-    if (draw.indexed) {
+    if (draw.indexed && keepFirstVertex) {
         Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - inputs.maxIndex, "indexed draw vertex range overflow");
         inputs.maxIndex += draw.firstVertex;
         inputs.minIndex += draw.firstVertex;
@@ -1995,16 +1997,18 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             continue;
         }
         // An indirect draw's counts are unknown here: the descriptor's whole range is copied.
-        const auto bytes = (args != nullptr ? VertexBufferExtent(attribute) : VertexBufferReadSize(attribute, inputs.maxIndex, draw.instanceCount, draw.firstInstance)) + widened;
         const auto& fields = attribute.resource.fields;
-        const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
-        const auto firstByte = args == nullptr ? VertexBufferReadOffset(attribute, draw.firstVertex, draw.firstInstance) : 0;
-        Require(!state.hasColorTarget || address + bytes <= state.color.MemoryAddress() || state.color.MemoryAddress() + state.color.bytes <= address + firstByte, "vertex buffer aliases the render target");
         const auto stride = (fields[1] >> 16u) & 0x3fffu;
+        const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
+        const auto fetchShift = !keepFirstVertex && args == nullptr && attribute.fetchIndex == 0 ? static_cast<std::uint64_t>(draw.firstVertex) * stride : 0;
+        const auto fetchBase = address + fetchShift;
+        const auto bytes = (args != nullptr ? VertexBufferExtent(attribute) : VertexBufferReadSize(attribute, inputs.maxIndex, draw.instanceCount, draw.firstInstance)) + widened;
+        Require(!state.hasColorTarget || fetchBase + bytes <= state.color.MemoryAddress() || state.color.MemoryAddress() + state.color.bytes <= fetchBase, "vertex buffer aliases the render target");
         fetchOf[i] = fetches.size();
-        fetches.push_back({address, address + bytes, stride, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
+        fetches.push_back({fetchBase, fetchBase + bytes, stride, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
         const auto recordBytes = static_cast<std::uint64_t>(fields[2]) * stride;
-        fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
+        const auto validBytes = recordBytes > fetchShift ? std::min(recordBytes - fetchShift, static_cast<std::uint64_t>(bytes)) : 0;
+        fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(validBytes) : bytes);
     }
     const auto soloFetches = SoloZeroPaddedFetchIndices(fetches, fetchValid);
     auto& isSolo = planLease->isSolo;
@@ -2339,7 +2343,7 @@ bool recordDrawCommandsImpl(const Context& context, VkCommandBuffer commands, co
     if (inputs.expandedIndexCount != 0u) {
         context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indexHandle, inputs.indexOffset, VK_INDEX_TYPE_UINT32);
         CountVkDraw(VkDrawKind::Indexed);
-        context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, inputs.expandedIndexCount, draw.instanceCount, 0, static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
+        context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, inputs.expandedIndexCount, draw.instanceCount, 0, static_cast<std::int32_t>(inputs.firstVertex), draw.firstInstance);
         emitted = true;
         return true;
     }
@@ -2347,12 +2351,12 @@ bool recordDrawCommandsImpl(const Context& context, VkCommandBuffer commands, co
     if (args == nullptr) {
         if (draw.indexed) {
             CountVkDraw(VkDrawKind::Indexed);
-            context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, pieceFirstIndex ? draw.indexCount : inputs.indexCount.value_or(draw.indexCount), draw.instanceCount, pieceFirstIndex.value_or(0u), static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
+            context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, pieceFirstIndex ? draw.indexCount : inputs.indexCount.value_or(draw.indexCount), draw.instanceCount, pieceFirstIndex.value_or(0u), static_cast<std::int32_t>(inputs.firstVertex), draw.firstInstance);
             recorded(subdraw++);
             emitted = true;
         } else {
             CountVkDraw(VkDrawKind::Direct);
-            context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, draw.indexCount, draw.instanceCount, draw.firstVertex, draw.firstInstance);
+            context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, draw.indexCount, draw.instanceCount, inputs.firstVertex, draw.firstInstance);
             recorded(subdraw++);
             emitted = true;
         }
