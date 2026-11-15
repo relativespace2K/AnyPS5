@@ -4903,6 +4903,15 @@ bool ImportsHeldByThisThread() {
     return importsHeld != 0;
 }
 
+std::optional<GuestAllocationSpan> GuestAllocationContaining(const std::uint64_t address, const std::uint64_t end) {
+    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    const auto* range = containingRange(lease, address, end);
+    if (range == nullptr) return std::nullopt;
+    const auto base = range->allocationAddress != 0 ? range->allocationAddress : range->address;
+    const auto bytes = range->allocationAddress != 0 ? range->allocationBytes : range->bytes;
+    return GuestAllocationSpan{base, bytes, range->backingSerial};
+}
+
 bool HostImportUsesDmaBuf(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& state = Imports();

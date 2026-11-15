@@ -58,6 +58,7 @@ std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std:
 
 struct DrawInputCopy {
     std::shared_ptr<Buffer> buffer;
+    VkDeviceSize offset = 0;
     bool reused = false;
     std::uint32_t derived = 0;
     std::uint32_t lowest = 0;
@@ -67,7 +68,7 @@ struct DrawInputCopy {
     Recorder::OwnedDrawInputProof owned;
 };
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, std::size_t from = 0);
-DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride = 0);
+DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride = 0, std::size_t bindFrom = 0);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived, std::uint32_t lowest = 0);
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite = nullptr);
 struct InPlaceIndices {

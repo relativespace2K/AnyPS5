@@ -1477,6 +1477,14 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
     copy.from = from;
     if (recorder != nullptr && bytes != 0) {
         GuestMemory::FlushGpuWrites(address, bytes);
+        if (bytes > (std::size_t{1} << 30u)) {
+            VkDeviceSize sparseOffset = 0;
+            copy.buffer = Buffer::SparseGuestImport(context, address, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT, from, bytes - from, &sparseOffset);
+            if (copy.buffer != nullptr) {
+                copy.offset = sparseOffset;
+                return copy;
+            }
+        }
 #ifdef _WIN32
         const bool owned = !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedDrawInputs);
 #else
@@ -1504,7 +1512,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
     return copy;
 }
 
-DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride) {
+DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride, std::size_t bindFrom) {
     Require(validBytes <= bytes, "the valid bytes of a vertex fetch exceed the fetch");
     auto readable = validBytes;
     if (stride != 0 && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), validBytes)) {
@@ -1526,6 +1534,15 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
             return copy;
         }
         copy.buffer = nullptr;
+    }
+    if (bytes > (std::size_t{1} << 30u)) {
+        VkDeviceSize sparseOffset = 0;
+        copy.buffer = Buffer::SparseGuestImport(context, address, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, bindFrom, bytes - bindFrom, &sparseOffset);
+        if (copy.buffer != nullptr) {
+            copy.offset = sparseOffset;
+            return copy;
+        }
+        throw std::runtime_error("AGC graphics: sparse guest import of the vertex range failed");
     }
     copy.buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     const auto span = copy.buffer->Bytes();
@@ -2043,15 +2060,18 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex, rangeFrom[range]);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
         rangeHandles.push_back(copy.buffer->Handle());
-        rangeOffsets.push_back(0);
+        rangeOffsets.push_back(copy.offset);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
     std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
+    std::vector<VkDeviceSize> soloOffsets(fetches.size(), 0);
     for (const auto f : soloFetches) {
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
-        auto copy = CopyZeroPaddedDrawInput(context, begin, bytes, fetchValid[f], fetches[f].stride);
+        const auto bindFrom = fetches[f].fetchIndex == 0 ? static_cast<std::size_t>(keepFirstVertex ? draw.firstVertex : 0u) * fetches[f].stride : 0u;
+        auto copy = CopyZeroPaddedDrawInput(context, begin, bytes, fetchValid[f], fetches[f].stride, bindFrom);
         soloHandles[f] = copy.buffer->Handle();
+        soloOffsets[f] = copy.offset;
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
     for (std::size_t i = 0; i < attributes.size(); ++i) {
@@ -2064,7 +2084,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto f = fetchOf[i];
         if (isSolo[f]) {
             inputs.vertexHandles.push_back(soloHandles[f]);
-            inputs.vertexOffsets[i] = 0;
+            inputs.vertexOffsets[i] = soloOffsets[f];
             continue;
         }
         const auto j = plannedOf[f];

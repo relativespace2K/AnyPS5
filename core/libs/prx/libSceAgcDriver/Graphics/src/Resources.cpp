@@ -4,13 +4,21 @@
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestWorkMark.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstdio>
 #include <exception>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <vector>
 #ifdef __APPLE__
 #include <cstring>
 #endif
@@ -59,6 +67,149 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
 std::shared_ptr<Buffer> Buffer::WithinDeviceLocalHeadroom(const Context& context, std::size_t size, VkBufferUsageFlags usage) {
     std::shared_ptr<Buffer> buffer(new Buffer(context, size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true));
     return buffer->ready ? buffer : nullptr;
+}
+
+Buffer::Buffer(const Context& context, std::size_t size, VkBuffer buffer, std::vector<VkDeviceMemory> sparseMemories, std::vector<std::shared_ptr<void>> hostImportAccesses) : context(context), buffer(buffer), sparseMemories(std::move(sparseMemories)), hostImportAccesses(std::move(hostImportAccesses)), size(size), capacity(size) {
+    usage = 0;
+    properties = 0;
+    ready = true;
+}
+
+std::shared_ptr<Buffer> Buffer::SparseGuestImport(const Context& context, const std::uint64_t address, const std::size_t bytes, const VkBufferUsageFlags usage, const VkDeviceSize bindOffset, const VkDeviceSize bindBytes, VkDeviceSize* offset) {
+    if (offset == nullptr || bytes == 0 || !context.sparseBinding || !context.sparseResidencyBuffer || context.sparseQueue == VK_NULL_HANDLE) return {};
+    constexpr VkDeviceSize Block = 65536;
+    constexpr VkDeviceSize Chunk = VkDeviceSize{1} << 29u;
+    const auto alignment = std::max<VkDeviceSize>(Block, context.hostImportAlignment);
+    const auto requestedBegin = address & ~(alignment - 1);
+    const auto requestedEnd = (address + bytes + alignment - 1) & ~(alignment - 1);
+    if (requestedEnd <= requestedBegin) return {};
+    const auto bindStart = std::min<VkDeviceSize>(bindOffset, bytes);
+    const auto bindLength = std::min<VkDeviceSize>(bindBytes, bytes - bindStart);
+    const auto bindBegin = std::max<std::uint64_t>(requestedBegin, (address + bindStart) & ~(alignment - 1));
+    const auto bindEnd = std::min<std::uint64_t>(requestedEnd, (address + bindStart + bindLength + alignment - 1) & ~(alignment - 1));
+    if (bindEnd <= bindBegin) return {};
+    constexpr VkDeviceSize Region = VkDeviceSize{4} << 30u;
+    const auto regionBase = address & ~(Region - 1);
+    auto cacheBase = regionBase;
+    auto cacheEnd = regionBase + Region;
+    if (requestedBegin < cacheBase || requestedEnd > cacheEnd) {
+        cacheBase = requestedBegin;
+        cacheEnd = requestedEnd;
+    }
+    if (cacheEnd <= cacheBase) return {};
+    const auto cacheBytes = cacheEnd - cacheBase;
+    const std::uint64_t backingSerial = 0;
+    struct CacheEntry {
+        std::shared_ptr<Buffer> buffer;
+        std::uint64_t backingSerial;
+    };
+    static std::mutex cacheMutex;
+    using CacheKey = std::array<std::uint64_t, 4>;
+    static auto* cache = new std::map<CacheKey, CacheEntry>;
+    const CacheKey cacheKey{static_cast<std::uint64_t>(cacheBase), static_cast<std::uint64_t>(cacheBytes), bindBegin, bindEnd};
+    {
+        std::lock_guard lock(cacheMutex);
+        const auto found = cache->find(cacheKey);
+        if (found != cache->end()) {
+            if (found->second.backingSerial == backingSerial && address >= cacheBase && address + bytes <= cacheBase + cacheBytes) {
+                *offset = address - cacheBase;
+                return found->second.buffer;
+            }
+            cache->erase(found);
+        }
+    }
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = cacheBytes;
+    info.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    auto result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &buffer);
+    if (result != VK_SUCCESS) {
+        std::fprintf(stderr, "[gpu] sparse guest import of 0x%llx+0x%llx: vkCreateBuffer failed (%d)\n", static_cast<unsigned long long>(cacheBase), static_cast<unsigned long long>(cacheBytes), static_cast<int>(result));
+        return {};
+    }
+    VkMemoryRequirements requirements{};
+    context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, buffer, &requirements);
+    std::vector<VkSparseMemoryBind> binds;
+    std::vector<VkDeviceMemory> memories;
+    const auto cleanup = [&] {
+        for (const auto memory : memories) MemoryAccounting::Free(context, memory);
+        memories.clear();
+        context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+    };
+    std::vector<std::shared_ptr<void>> hostImportAccesses;
+    const auto commit = GuestMemory::DescribeCommitted(cacheBase, cacheBytes);
+    for (const auto& [rawFirst, rawLast] : commit.ranges) {
+        const auto first = std::max<std::uint64_t>(rawFirst, bindBegin);
+        const auto last = std::min<std::uint64_t>(rawLast, bindEnd);
+        if (first >= last) continue;
+        hostImportAccesses.push_back(std::make_shared<GuestArena::HostImportAccess>(reinterpret_cast<void*>(first), static_cast<std::size_t>(last - first)));
+        auto cursor = (first + alignment - 1) & ~(alignment - 1);
+        const auto limit = last & ~(alignment - 1);
+        while (cursor < limit) {
+            const auto piece = std::min<VkDeviceSize>(limit - cursor, Chunk) & ~(alignment - 1);
+            if (piece == 0) break;
+            VkMemoryHostPointerPropertiesEXT pointer{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+            result = context.Function<PFN_vkGetMemoryHostPointerPropertiesEXT>("vkGetMemoryHostPointerPropertiesEXT")(context.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, reinterpret_cast<void*>(cursor), &pointer);
+            if (result != VK_SUCCESS) {
+                std::fprintf(stderr, "[gpu] sparse guest import of 0x%llx+0x%llx: vkGetMemoryHostPointerPropertiesEXT at 0x%llx failed (%d); leaving the block zero\n", static_cast<unsigned long long>(cacheBase), static_cast<unsigned long long>(cacheBytes), static_cast<unsigned long long>(cursor), static_cast<int>(result));
+                cursor += piece;
+                continue;
+            }
+            const auto types = pointer.memoryTypeBits & requirements.memoryTypeBits;
+            if (types == 0) {
+                std::fprintf(stderr, "[gpu] sparse guest import of 0x%llx+0x%llx: no memory type for the host import; leaving the block zero\n", static_cast<unsigned long long>(cacheBase), static_cast<unsigned long long>(cacheBytes));
+                cursor += piece;
+                continue;
+            }
+            const VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, reinterpret_cast<void*>(cursor)};
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import};
+            allocation.allocationSize = piece;
+            allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(types));
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            result = MemoryAccounting::Allocate(context, allocation, "sparse guest import", &memory);
+            if (result != VK_SUCCESS) {
+                std::fprintf(stderr, "[gpu] sparse guest import of 0x%llx+0x%llx: vkAllocateMemory at 0x%llx+0x%llx failed (%d); leaving the block zero\n", static_cast<unsigned long long>(cacheBase), static_cast<unsigned long long>(cacheBytes), static_cast<unsigned long long>(cursor), static_cast<unsigned long long>(piece), static_cast<int>(result));
+                cursor += piece;
+                continue;
+            }
+            memories.push_back(memory);
+            binds.push_back(VkSparseMemoryBind{cursor - cacheBase, piece, memory, 0, 0});
+            cursor += piece;
+        }
+    }
+    if (binds.empty()) {
+        cleanup();
+        return {};
+    }
+    VkSparseBufferMemoryBindInfo bufferBind{buffer, static_cast<std::uint32_t>(binds.size()), binds.data()};
+    VkBindSparseInfo sparse{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+    sparse.bufferBindCount = 1;
+    sparse.pBufferBinds = &bufferBind;
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence = VK_NULL_HANDLE;
+    result = context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &fence);
+    if (result == VK_SUCCESS) {
+        std::unique_lock<std::mutex> queueLock;
+        if (context.sparseQueueMutex != nullptr) queueLock = std::unique_lock<std::mutex>(*context.sparseQueueMutex);
+        result = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(context.sparseQueue, 1, &sparse, fence);
+        if (result == VK_SUCCESS) result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max());
+        context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
+    }
+    if (result != VK_SUCCESS) {
+        std::fprintf(stderr, "[gpu] sparse guest import of 0x%llx+0x%llx: sparse bind failed (%d)\n", static_cast<unsigned long long>(cacheBase), static_cast<unsigned long long>(cacheBytes), static_cast<int>(result));
+        cleanup();
+        return {};
+    }
+    std::shared_ptr<Buffer> created(new Buffer(context, static_cast<std::size_t>(cacheBytes), buffer, std::move(memories), std::move(hostImportAccesses)));
+    std::fprintf(stderr, "[gpu] sparse guest import of 0x%llx+0x%llx ok: %zu memories, offset %llu\n", static_cast<unsigned long long>(cacheBase), static_cast<unsigned long long>(cacheBytes), created->sparseMemories.size(), static_cast<unsigned long long>(address - cacheBase));
+    {
+        std::lock_guard lock(cacheMutex);
+        (*cache)[cacheKey] = CacheEntry{created, backingSerial};
+    }
+    *offset = address - cacheBase;
+    return created;
 }
 
 Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool headroom) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(BufferPool::Usage(usage, properties)), properties(properties) {
@@ -146,6 +297,15 @@ Buffer::~Buffer() {
 }
 
 void Buffer::release() noexcept {
+    if (!sparseMemories.empty()) {
+        for (const auto memory : sparseMemories) MemoryAccounting::Free(context, memory);
+        sparseMemories.clear();
+        hostImportAccesses.clear();
+        if (buffer != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::destroyBuffer, "vkDestroyBuffer")(context.device, buffer, nullptr);
+        buffer = VK_NULL_HANDLE;
+        ready = false;
+        return;
+    }
     if (ready && cache) {
         cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size});
         return;
