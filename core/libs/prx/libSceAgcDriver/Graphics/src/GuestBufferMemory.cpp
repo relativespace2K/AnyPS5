@@ -6886,9 +6886,31 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
     }
 }
 
+namespace {
+
+struct PinnedGuestRanges {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+
+    explicit PinnedGuestRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>> pinned) : ranges(std::move(pinned)) {
+        for (const auto& [first, last] : ranges) {
+            if (last > first) GuestArena::GuestArenaPinWritable_nid_postfix(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(first)), static_cast<std::size_t>(last - first));
+        }
+    }
+
+    ~PinnedGuestRanges() {
+        for (auto it = ranges.rbegin(); it != ranges.rend(); ++it) {
+            if (it->second > it->first) GuestArena::GuestArenaUnpinWritable_nid_postfix(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(it->first)), static_cast<std::size_t>(it->second - it->first));
+        }
+    }
+};
+
+}
+
 void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool traceCopy = std::getenv("APS5_TRACE_UPLOAD_COPY") != nullptr;
     const auto bytes = region.end - region.begin;
+    if (traceCopy && bytes > (std::uint64_t{64} << 10u)) std::fprintf(stderr, "[upload-copy] begin=0x%llx end=0x%llx sparse=%u hostBacked=%u writable=%u snapshot=0x%llx snapBytes=%zu\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end), static_cast<unsigned>(region.sparse), static_cast<unsigned>(region.hostBacked), static_cast<unsigned>(region.writable), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(region.snapshot.data())), region.snapshot.size());
     const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | (addressable ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
     std::uint64_t readBytes = 0;
     bool inImport = false;
@@ -6949,31 +6971,35 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
     // Named for the [hooksync] attribution: the reads below go through the flush hook.
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::BufferUpload);
+    std::optional<PinnedGuestRanges> pinned;
+    if (region.hostBacked || region.writable) {
+        if (region.sparse) pinned.emplace(region.backed);
+        else pinned.emplace(std::vector<std::pair<std::uint64_t, std::uint64_t>>{{region.begin, region.begin + allocated}});
+    }
     if (region.hostBacked || region.writable) {
         // Only ranges a descriptor may write need the copy the write-back diffs against; the
         // registered ranges of an address-based shader are read-only to it (AddressRanges).
-        if (!region.sparse) {
-            GuestMemory::Read(region.begin, region.buffer->Bytes());
-            readBytes += region.buffer->Bytes().size();
-            if (written) region.uploaded.assign(region.buffer->Bytes().begin(), region.buffer->Bytes().end());
-        } else {
-            // `uploaded` holds the backed pieces back to back.
-            const auto target = region.buffer->Bytes().first(static_cast<std::size_t>(allocated));
-            std::size_t cursor = 0;
-            for (const auto& [first, last] : region.backed) {
-                const auto at = static_cast<std::size_t>(first - region.begin);
-                if (at > cursor) std::memset(target.data() + cursor, 0, at - cursor);
-                const auto piece = target.subspan(at, static_cast<std::size_t>(last - first));
-                GuestMemory::Read(first, piece);
-                readBytes += piece.size();
-                if (written) region.uploaded.insert(region.uploaded.end(), piece.begin(), piece.end());
-                cursor = at + piece.size();
-            }
-            if (cursor < target.size()) std::memset(target.data() + cursor, 0, target.size() - cursor);
+        // The committed parts are queried again here: a range whose committed set shrank after the
+        // upload was prepared must read its holes as zeros, not fault on a page the guest freed.
+        const auto target = region.buffer->Bytes().first(static_cast<std::size_t>(allocated));
+        if (traceCopy && allocated > (64u << 10u)) std::fprintf(stderr, "[upload-copy] guest read begin=0x%llx allocated=0x%llx\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(allocated));
+        std::size_t cursor = 0;
+        for (const auto& [first, last] : GuestMemory::CommittedRanges(region.begin, static_cast<std::size_t>(allocated))) {
+            const auto at = static_cast<std::size_t>(first - region.begin);
+            if (at > cursor) std::memset(target.data() + cursor, 0, at - cursor);
+            const auto piece = target.subspan(at, static_cast<std::size_t>(last - first));
+            GuestMemory::Read(first, piece);
+            readBytes += piece.size();
+            if (written) region.uploaded.insert(region.uploaded.end(), piece.begin(), piece.end());
+            cursor = at + piece.size();
         }
+        if (cursor < target.size()) std::memset(target.data() + cursor, 0, target.size() - cursor);
     }
     else {
-        if (!shared) std::memcpy(region.buffer->Bytes().data(), region.snapshot.data(), region.snapshot.size());
+        if (!shared) {
+            if (traceCopy && allocated > (64u << 10u)) std::fprintf(stderr, "[upload-copy] snapshot memcpy src=0x%llx bytes=%zu\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(region.snapshot.data())), region.snapshot.size());
+            std::memcpy(region.buffer->Bytes().data(), region.snapshot.data(), region.snapshot.size());
+        }
         readBytes += region.snapshot.size();
     }
     region.snapshot.clear();

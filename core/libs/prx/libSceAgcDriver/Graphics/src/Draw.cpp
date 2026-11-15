@@ -1477,7 +1477,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
     copy.from = from;
     if (recorder != nullptr && bytes != 0) {
         GuestMemory::FlushGpuWrites(address, bytes);
-        if (bytes > (std::size_t{1} << 30u)) {
+        if (bytes > (std::size_t{64} << 20u)) {
             VkDeviceSize sparseOffset = 0;
             copy.buffer = Buffer::SparseGuestImport(context, address, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT, from, bytes - from, &sparseOffset);
             if (copy.buffer != nullptr) {
@@ -1535,7 +1535,7 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
         }
         copy.buffer = nullptr;
     }
-    if (bytes > (std::size_t{1} << 30u)) {
+    if (bytes > (std::size_t{64} << 20u)) {
         VkDeviceSize sparseOffset = 0;
         copy.buffer = Buffer::SparseGuestImport(context, address, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, bindFrom, bytes - bindFrom, &sparseOffset);
         if (copy.buffer != nullptr) {

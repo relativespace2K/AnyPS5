@@ -14,6 +14,7 @@
 #include <array>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <list>
@@ -188,6 +189,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBuffer buffer, std::v
 }
 
 std::shared_ptr<Buffer> Buffer::SparseGuestImport(const Context& context, const std::uint64_t address, const std::size_t bytes, const VkBufferUsageFlags usage, const VkDeviceSize bindOffset, const VkDeviceSize bindBytes, VkDeviceSize* offset) {
+    if (std::getenv("APS5_NO_SPARSE_GUEST_IMPORT") != nullptr) return {};
     if (offset == nullptr || bytes == 0 || !context.sparseBinding || !context.sparseResidencyBuffer || context.sparseQueue == VK_NULL_HANDLE) return {};
     const bool settleUpload = SparseUploadOnSettleQueue(context);
     if (!settleUpload && !GuestMemory::GpuMutex().HeldByThisThread()) return {};
