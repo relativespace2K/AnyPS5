@@ -552,6 +552,10 @@ std::size_t BufferPool::MaxSlots() {
     return slots;
 }
 
+VkDeviceSize BufferPool::Reclaim() {
+    return trim();
+}
+
 VkDeviceSize BufferPool::trim() {
     Tier retiredSmall;
     Tier retiredLarge;

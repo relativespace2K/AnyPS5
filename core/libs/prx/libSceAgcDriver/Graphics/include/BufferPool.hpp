@@ -76,6 +76,7 @@ public:
     VkDeviceMemory TakeImageMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr, bool newImage = false);
     void PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept;
     std::size_t RetainedImages();
+    VkDeviceSize Reclaim();
     std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, const char* category = nullptr, bool hostPlaced = false);
     void Put(const BufferAllocation& allocation) noexcept;
     VkDeviceSize ReclaimIdleDevice(VkDeviceSize bytes, std::chrono::steady_clock::time_point now);

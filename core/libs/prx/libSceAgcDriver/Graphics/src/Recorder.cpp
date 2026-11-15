@@ -7,6 +7,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ReferenceStorage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -4628,7 +4629,14 @@ void Recorder::Submit() {
     DestroyDeferredAtIdle(context);
     const auto submitStart = std::chrono::steady_clock::now();
     batch->submitStarted.store(true, std::memory_order_release);
-    const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+        const auto reclaimed = context.bufferPool != nullptr ? context.bufferPool->Reclaim() : 0;
+        if (reclaimed != 0) {
+            std::fprintf(stderr, "[gpu] vkQueueSubmit recorder: reclaimed %llu MiB from the buffer pool and retried\n", static_cast<unsigned long long>(reclaimed >> 20u));
+            result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+        }
+    }
     if (result == VK_ERROR_DEVICE_LOST) {
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
         if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
