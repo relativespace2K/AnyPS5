@@ -98,26 +98,6 @@ std::shared_ptr<Buffer> Buffer::SparseGuestImport(const Context& context, const 
     }
     if (cacheEnd <= cacheBase) return {};
     const auto cacheBytes = cacheEnd - cacheBase;
-    const std::uint64_t backingSerial = 0;
-    struct CacheEntry {
-        std::shared_ptr<Buffer> buffer;
-        std::uint64_t backingSerial;
-    };
-    static std::mutex cacheMutex;
-    using CacheKey = std::array<std::uint64_t, 4>;
-    static auto* cache = new std::map<CacheKey, CacheEntry>;
-    const CacheKey cacheKey{static_cast<std::uint64_t>(cacheBase), static_cast<std::uint64_t>(cacheBytes), bindBegin, bindEnd};
-    {
-        std::lock_guard lock(cacheMutex);
-        const auto found = cache->find(cacheKey);
-        if (found != cache->end()) {
-            if (found->second.backingSerial == backingSerial && address >= cacheBase && address + bytes <= cacheBase + cacheBytes) {
-                *offset = address - cacheBase;
-                return found->second.buffer;
-            }
-            cache->erase(found);
-        }
-    }
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = cacheBytes;
     info.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -203,11 +183,6 @@ std::shared_ptr<Buffer> Buffer::SparseGuestImport(const Context& context, const 
         return {};
     }
     std::shared_ptr<Buffer> created(new Buffer(context, static_cast<std::size_t>(cacheBytes), buffer, std::move(memories), std::move(hostImportAccesses)));
-    std::fprintf(stderr, "[gpu] sparse guest import of 0x%llx+0x%llx ok: %zu memories, offset %llu\n", static_cast<unsigned long long>(cacheBase), static_cast<unsigned long long>(cacheBytes), created->sparseMemories.size(), static_cast<unsigned long long>(address - cacheBase));
-    {
-        std::lock_guard lock(cacheMutex);
-        (*cache)[cacheKey] = CacheEntry{created, backingSerial};
-    }
     *offset = address - cacheBase;
     return created;
 }
