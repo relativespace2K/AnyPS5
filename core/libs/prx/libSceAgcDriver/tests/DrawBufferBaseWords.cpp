@@ -37,8 +37,9 @@ void CheckRange(std::uint64_t bufferAddress, std::uint32_t stride, std::uint32_t
     TagDrawBufferBases_nid_no_patch(variant, words, true);
     Check(variant.dataPositions.empty() != allowed, "captured buffer range was misclassified for base relocation");
     if (allowed) {
-        Check(variant.dataPositions.size() == 1u && variant.dataPositions[0] == 0u, "base relocation did not select only the base word");
-        Check(variant.bufferWordBuffers.size() == 1u && variant.bufferWordBuffers[0].size() == 2u, "base relocation did not patch both the buffer and flat SRT copy");
+        Check(variant.dataPositions.size() == 2u && variant.dataPositions[0] == 0u && variant.dataPositions[1] == 1u, "base relocation did not select both descriptor words");
+        Check(variant.bufferWordBuffers.size() == 2u && variant.bufferWordBuffers[0].size() == 2u && variant.bufferWordBuffers[1].size() == 2u, "base relocation did not patch both words of the buffer and flat SRT copies");
+        Check(!variant.bufferWordBuffers[0][0].high && variant.bufferWordBuffers[1][0].high, "base relocation did not mark the descriptor high words");
     }
     DispatchVariant unknown;
     unknown.compiled = compiled;

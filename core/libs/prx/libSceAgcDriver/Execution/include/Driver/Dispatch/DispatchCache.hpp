@@ -62,9 +62,15 @@ struct DispatchVariant {
     std::vector<std::uint32_t> dataSlots;
     std::uint32_t flatBinding = NoFlatBinding;
 
+    struct BufferWordPatch {
+        std::uint32_t binding;
+        std::uint32_t word;
+        std::uint32_t expected;
+        bool high;
+    };
     std::uint32_t pushOffset = 0;
     std::shared_ptr<const ShaderRecompiler::SourceHandle> prepared;
-    std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> bufferWordBuffers;
+    std::vector<std::vector<BufferWordPatch>> bufferWordBuffers;
     std::vector<std::int8_t> runBases;
     std::uint64_t relocatableWords = 0;
     std::uint64_t userWordsWalked = 0;

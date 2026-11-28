@@ -422,7 +422,7 @@ void Driver::tagBufferWords(DispatchVariant& variant, std::span<const ShaderReco
 void TagDrawBufferBases_nid_no_patch(DispatchVariant& variant, std::span<const ShaderRecompiler::BufferBaseWord> bufferBaseWords, bool enabled) {
     if (!enabled || bufferBaseWords.empty() || variant.compiled == nullptr || !variant.dataPositions.empty()) return;
     const auto& compiled = *variant.compiled;
-    using Patches = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+    using Patches = std::vector<DispatchVariant::BufferWordPatch>;
     std::vector<std::pair<std::uint32_t, Patches>> tagged;
     for (const auto& base : bufferBaseWords) {
         if (!base.bufferRangeKnown) continue;
@@ -443,7 +443,7 @@ void TagDrawBufferBases_nid_no_patch(DispatchVariant& variant, std::span<const S
         }
         if (!located || position >= variant.words.size() || variant.words[position] == 0) continue;
         const auto value = variant.words[position];
-        Patches patches;
+        Patches patches, highPatches;
         std::size_t slots = 0, others = 0;
         for (std::size_t binding = 0; binding < compiled.bindings.size(); ++binding) {
             const auto& words = compiled.bindings[binding].guestDescriptor;
@@ -453,7 +453,12 @@ void TagDrawBufferBases_nid_no_patch(DispatchVariant& variant, std::span<const S
                 const bool flat = compiled.bindings[binding].role == ShaderRecompiler::DescriptorRole::FlattenedSrt && base.flatOffset >= 0 && static_cast<std::int64_t>(word) == base.flatOffset;
                 if (slot) ++slots;
                 if (!slot && !flat) ++others;
-                if (slot || flat) patches.emplace_back(static_cast<std::uint32_t>(binding), static_cast<std::uint32_t>(word));
+                if (slot || flat) {
+                    patches.push_back({static_cast<std::uint32_t>(binding), static_cast<std::uint32_t>(word), value, false});
+                    if (word + 1 < words.size() && base.bufferAddress != 0 && (words[word + 1] & 0xffffu) == ((base.bufferAddress >> 32u) & 0xffffu)) {
+                        highPatches.push_back({static_cast<std::uint32_t>(binding), static_cast<std::uint32_t>(word + 1), words[word + 1], true});
+                    }
+                }
             }
         }
         for (std::size_t at = 0; at + sizeof(std::uint32_t) <= compiled.pushConstants.size(); at += sizeof(std::uint32_t)) {
@@ -466,8 +471,17 @@ void TagDrawBufferBases_nid_no_patch(DispatchVariant& variant, std::span<const S
         }
         const auto expected = static_cast<std::size_t>(std::count_if(compiled.bufferBaseSlots.begin(), compiled.bufferBaseSlots.end(), [&](const std::array<std::uint32_t, 3>& entry) { return entry[0] == base.buffer; }));
         if (slots == 0 || slots != expected || others != 0) continue;
-        if (std::any_of(tagged.begin(), tagged.end(), [&](const auto& entry) { return entry.first == position; })) continue;
-        tagged.emplace_back(position, std::move(patches));
+        const auto addTagged = [&](std::uint32_t at, Patches entries) {
+            const auto held = std::find_if(tagged.begin(), tagged.end(), [&](const auto& entry) { return entry.first == at; });
+            if (held != tagged.end()) {
+                if (held->second.front().high != entries.front().high) return;
+                held->second.insert(held->second.end(), entries.begin(), entries.end());
+            } else {
+                tagged.emplace_back(at, std::move(entries));
+            }
+        };
+        addTagged(position, std::move(patches));
+        if (!highPatches.empty() && position + 1 < variant.words.size()) addTagged(position + 1, std::move(highPatches));
     }
     std::sort(tagged.begin(), tagged.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     for (auto& [position, patches] : tagged) {
@@ -484,10 +498,14 @@ std::shared_ptr<DispatchVariant> Driver::patchBufferWords(const DispatchVariant&
         const auto found = std::lower_bound(variant.dataPositions.begin(), variant.dataPositions.end(), position);
         if (found == variant.dataPositions.end() || *found != position || position >= copy->words.size()) return nullptr;
         const auto stored = copy->words[position];
-        if (stored == 0 || fresh == 0 || ((stored ^ fresh) & 3u) != 0) return nullptr;
-        for (const auto& [binding, word] : variant.bufferWordBuffers[static_cast<std::size_t>(found - variant.dataPositions.begin())]) {
-            if (binding >= rebased->bindings.size() || word >= rebased->bindings[binding].guestDescriptor.size() || rebased->bindings[binding].guestDescriptor[word] != stored) return nullptr;
-            rebased->bindings[binding].guestDescriptor[word] = fresh;
+        const auto& patches = variant.bufferWordBuffers[static_cast<std::size_t>(found - variant.dataPositions.begin())];
+        const bool high = !patches.empty() && patches.front().high;
+        if (!high && (stored == 0 || fresh == 0 || ((stored ^ fresh) & 3u) != 0)) return nullptr;
+        for (const auto& patch : patches) {
+            if (patch.binding >= rebased->bindings.size() || patch.word >= rebased->bindings[patch.binding].guestDescriptor.size()) return nullptr;
+            auto& word = rebased->bindings[patch.binding].guestDescriptor[patch.word];
+            if (word != patch.expected) return nullptr;
+            word = fresh;
         }
         copy->words[position] = fresh;
     }
